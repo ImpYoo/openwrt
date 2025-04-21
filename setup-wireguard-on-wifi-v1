@@ -1,0 +1,209 @@
+#!/bin/sh
+# nordlynx-router.sh — Optimized Split-tunnel VPN (only 'NordVPN' SSID via VPN)
+set -euo pipefail
+LOG=/tmp/nordlynx-router.log
+exec > >(tee -a "$LOG") 2>&1
+
+echo "### $(date) – NordVPN Split-Tunnel Setup Started"
+
+# Functions
+run() { echo "+ $*"; "$@" || { echo "❌ FAILED: $*" >&2; exit 1; }; }
+try() { echo "+ $* (ignore errors)"; "$@" >/dev/null 2>&1 || true; }
+
+# Configuration
+CONF="/etc/wireguard/nordlynx.conf"
+WG_IF="wg0"
+VPNLAN_NETWORK="192.168.89.0/24"
+VPNLAN_IP="192.168.89.1"
+WIFI_SSID="NordVPN"
+WIFI_PWD="ChangeMe1234"
+
+# Check if config exists
+[ -f "$CONF" ] || { echo "❌ Config missing: $CONF"; exit 1; }
+
+# Extract configuration
+get() { awk '$1=="'$1'"{print $3}' "$CONF"; }
+PRIVATE_KEY=$(get PrivateKey)
+ADDRESS=$(get Address)
+DNS1=$(get DNS | cut -d, -f1)
+DNS2=$(get DNS | cut -d, -f2 | tr -d ',')
+PUBKEY=$(get PublicKey)
+ENDPOINT=$(get Endpoint)
+PERSIST=$(get PersistentKeepalive)
+ENDPOINT_HOST=${ENDPOINT%:*}
+ENDPOINT_PORT=${ENDPOINT##*:}
+
+echo "🏋 Configuration loaded from $CONF"
+echo "🌐 VPN Address: $ADDRESS"
+echo "💉 Endpoint: $ENDPOINT_HOST:$ENDPOINT_PORT"
+echo "🔄 PersistentKeepalive: $PERSIST"
+
+# Cleanup previous configuration
+echo "🪩 Cleaning previous configuration..."
+try uci -q delete network."$WG_IF"
+try uci -q delete network.nordvpn_peer
+try uci -q delete network.vpnlan
+try uci -q delete network.br_vpnlan
+try uci -q delete dhcp.vpnlan
+try uci -q delete wireless.nordvpn_ap
+try uci -q delete firewall.vpn
+try uci -q delete firewall.vpn_fwd
+try uci -q delete firewall.vpn_icmp
+
+# 1. WireGuard Interface Setup
+echo "⚙️ Setting up WireGuard interface $WG_IF"
+run uci set network."$WG_IF"="interface"
+run uci set network."$WG_IF".proto="wireguard"
+run uci set network."$WG_IF".private_key="$PRIVATE_KEY"
+run uci add_list network."$WG_IF".addresses="$ADDRESS"
+run uci set network."$WG_IF".peerdns="0"
+run uci add_list network."$WG_IF".dns="$DNS1"
+run uci add_list network."$WG_IF".dns="$DNS2"
+
+run uci set network.nordvpn_peer="wireguard_$WG_IF"
+run uci set network.nordvpn_peer.public_key="$PUBKEY"
+run uci set network.nordvpn_peer.allowed_ips="0.0.0.0/0,::/0"
+run uci set network.nordvpn_peer.endpoint_host="$ENDPOINT_HOST"
+run uci set network.nordvpn_peer.endpoint_port="$ENDPOINT_PORT"
+run uci set network.nordvpn_peer.persistent_keepalive="$PERSIST"
+run uci set network.nordvpn_peer.description="NordVPN Server"
+
+# 2. VPN LAN Bridge Interface
+echo "🌋 Creating VPN LAN bridge interface"
+run uci set network.br_vpnlan="device"
+run uci set network.br_vpnlan.name="br-vpnlan"
+run uci set network.br_vpnlan.type="bridge"
+run uci set network.vpnlan="interface"
+run uci set network.vpnlan.proto="static"
+run uci set network.vpnlan.ipaddr="$VPNLAN_IP"
+run uci set network.vpnlan.netmask="255.255.255.0"
+run uci set network.vpnlan.device="br-vpnlan"
+run uci set network.vpnlan.force_link="1"
+run uci set network.vpnlan.delegate="0"
+run uci set network.vpnlan.dns="$DNS1"
+[ -n "$DNS2" ] && run uci add_list network.vpnlan.dns="$DNS2"
+run uci set network.vpnlan.peerdns="0"
+
+# 3. DHCP Server for VPN LAN
+echo "🔄 Configuring DHCP server for VPN LAN"
+run uci set dhcp.vpnlan="dhcp"
+run uci set dhcp.vpnlan.interface="vpnlan"
+run uci set dhcp.vpnlan.start="100"
+run uci set dhcp.vpnlan.limit="150"
+run uci set dhcp.vpnlan.leasetime="12h"
+run uci set dhcp.vpnlan.force="1"
+try uci delete dhcp.vpnlan.dhcp_option
+DNS_OPTION="6,$DNS1"
+[ -n "$DNS2" ] && DNS_OPTION="$DNS_OPTION,$DNS2"
+run uci add_list dhcp.vpnlan.dhcp_option="$DNS_OPTION"
+run uci set dhcp.vpnlan.dhcpv6="disabled"
+run uci set dhcp.vpnlan.ra="disabled"
+
+# Reset LAN DNS
+try uci delete dhcp.lan.dhcp_option
+run uci add_list dhcp.lan.dhcp_option="6,192.168.178.1"
+
+# 4. Wi-Fi AP Configuration
+echo "📶 Setting up VPN Wi-Fi AP: $WIFI_SSID"
+RADIO=$(uci show wireless | grep '=wifi-device' | head -n1 | cut -d. -f2 | cut -d= -f1)
+[ -n "$RADIO" ] || { echo "❌ No Wi-Fi radio found"; exit 1; }
+
+run uci set wireless.nordvpn_ap="wifi-iface"
+run uci set wireless.nordvpn_ap.device="$RADIO"
+run uci set wireless.nordvpn_ap.mode="ap"
+run uci set wireless.nordvpn_ap.ssid="$WIFI_SSID"
+run uci set wireless.nordvpn_ap.encryption="psk2"
+run uci set wireless.nordvpn_ap.key="$WIFI_PWD"
+run uci set wireless.nordvpn_ap.network="vpnlan"
+run uci set wireless.nordvpn_ap.disabled="0"
+
+# 5. Firewall Configuration
+echo "🔥 Configuring firewall for VPN"
+run uci set firewall.vpn="zone"
+run uci set firewall.vpn.name="vpn"
+run uci set firewall.vpn.network="vpnlan $WG_IF"
+run uci set firewall.vpn.input="ACCEPT"
+run uci set firewall.vpn.output="ACCEPT"
+run uci set firewall.vpn.forward="ACCEPT"
+run uci set firewall.vpn.masq="1"
+run uci set firewall.vpn.mtu_fix="1"
+
+run uci set firewall.vpn_fwd="forwarding"
+run uci set firewall.vpn_fwd.src="vpn"
+run uci set firewall.vpn_fwd.dest="vpn"
+
+run uci set firewall.vpn_icmp="rule"
+run uci set firewall.vpn_icmp.name="Allow-ICMP-VPN"
+run uci set firewall.vpn_icmp.src="vpn"
+run uci set firewall.vpn_icmp.proto="icmp"
+run uci set firewall.vpn_icmp.target="ACCEPT"
+
+# 6. Commit all changes
+echo "📂 Committing all UCI changes"
+run uci commit network
+run uci commit firewall
+run uci commit wireless
+run uci commit dhcp
+
+# 7. Restart services
+echo "🔄 Restarting services"
+run /etc/init.d/network restart
+run /etc/init.d/firewall restart
+run /etc/init.d/dnsmasq restart
+run wifi reload
+
+# Wait for wg0 to be up
+echo "⏳ Waiting for $WG_IF to be up..."
+COUNT=0
+while ! ip link show "$WG_IF" >/dev/null 2>&1; do
+    sleep 1
+    COUNT=$((COUNT + 1))
+    [ "$COUNT" -gt 10 ] && echo "❌ $WG_IF interface not found" && exit 1
+done
+
+# 8. Set up policy routing
+echo "🔀 Configuring policy routing for VPN"
+grep -q "100 vpn" /etc/iproute2/rt_tables || echo "100 vpn" >> /etc/iproute2/rt_tables
+try ip rule del from $VPNLAN_NETWORK lookup vpn priority 100
+try ip route flush table vpn
+run ip route add default dev $WG_IF table vpn
+run ip rule add from $VPNLAN_NETWORK lookup vpn priority 100
+
+# 9. Ensure proper NAT is configured
+echo "🔒 Setting up NAT masquerading for VPN"
+for mod in nf_conntrack nf_nat xt_MASQUERADE ip_tables; do
+    try modprobe $mod
+done
+iptables -t nat -C POSTROUTING -o $WG_IF -j MASQUERADE 2>/dev/null || \
+    run iptables -t nat -A POSTROUTING -o $WG_IF -j MASQUERADE
+
+# 10. Create a validation script
+cat > /etc/hotplug.d/iface/99-vpncheck << 'EOF'
+#!/bin/sh
+[ "$ACTION" = "ifup" ] && [ "$INTERFACE" = "wg0" ] && {
+    ip route show table vpn >/dev/null 2>&1 || {
+        ip route add default dev wg0 table vpn
+    }
+    ip rule show | grep -q "from 192.168.89.0/24 lookup vpn" || {
+        ip rule add from 192.168.89.0/24 lookup vpn priority 100
+    }
+    iptables -t nat -C POSTROUTING -o wg0 -j MASQUERADE >/dev/null 2>&1 || {
+        iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
+    }
+    logger -t vpncheck "WireGuard VPN route check completed"
+}
+EOF
+chmod +x /etc/hotplug.d/iface/99-vpncheck
+
+# 11. Status check
+echo "📊 VPN Status Check"
+try wg show
+try ip route show table vpn
+try ip rule
+
+echo "🌍 External connection test"
+try curl -s https://ipinfo.io | grep -e ip -e city -e region -e country
+
+echo "✅ Setup complete. Clients on '$WIFI_SSID' SSID will use the VPN."
+echo "🔑 Wi-Fi password: $WIFI_PWD"
+echo "📍 Log file: $LOG"
