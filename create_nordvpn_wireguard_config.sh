@@ -7,8 +7,8 @@ COUNTRY_CODE="US"
 PRIVATE_KEY="" 
 
 # Static IP address and DNS settings (replace with your actual values if needed)
-IP_ADDRESS="10.5.0.2/16"
-DNS_SERVERS="103.86.96.100,103.86.99.100"
+IP_ADDRESS="10.5.0.2/32"
+DNS_SERVERS="103.86.96.100, 103.86.99.100"
 
 # Check for country code argument
 if [ $# -eq 1 ]; then
@@ -65,7 +65,7 @@ PUBLIC_KEY=$(echo "$WIREGUARD_SECTION" | grep -o '"name":"public_key","value":"[
 
 # Look for NordWhisper section to find port (since WireGuard doesn't explicitly list port)
 NORDWHISPER_SECTION=$(sed -n '/"identifier":"nordwhisper"/,/},/p' "$TMP_FILE")
-PORT=$(echo "$NORDWHISPER_SECTION" | grep -o '"name":"port","value":"[^"]*"' | sed 's/"name":"port","value":"//;s/"//')
+#PORT=$(echo "$NORDWHISPER_SECTION" | grep -o '"name":"port","value":"[^"]*"' | sed 's/"name":"port","value":"//;s/"//')
 
 # If no port found, use default 51820
 if [ -z "$PORT" ]; then
